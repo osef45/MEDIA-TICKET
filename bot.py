@@ -26,6 +26,9 @@ intents.members         = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Mode "Media Soon" — bloque l'ouverture de nouveaux tickets
+media_soon_enabled = False
+
 
 # ══════════════════════════════════════════════════════════════
 #  VIEW — Ticket inside (Notify + Close)
@@ -146,6 +149,22 @@ class TicketPanelView(discord.ui.View):
         custom_id="media_ticket:open"
     )
     async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if media_soon_enabled:
+            embed = discord.Embed(
+                title="🎬  Media Soon",
+                description=(
+                    "Les tickets média ne sont pas encore ouverts.\n"
+                    "Reviens bientôt, on te préviendra dès que c'est disponible !"
+                ),
+                color=0xFEE75C,
+                timestamp=datetime.datetime.utcnow(),
+            )
+            embed.set_footer(text="Media Ticket System")
+            if interaction.guild.icon:
+                embed.set_thumbnail(url=interaction.guild.icon.url)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
         guild    = interaction.guild
         category = guild.get_channel(TICKET_CATEGORY_ID)
 
@@ -304,6 +323,44 @@ async def setup(interaction: discord.Interaction):
 
 @setup.error
 async def setup_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ Tu dois avoir la permission **Administrateur** pour utiliser cette commande.",
+            ephemeral=True,
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+#  Slash command : /mediasoon
+# ──────────────────────────────────────────────────────────────
+@bot.tree.command(
+    name="mediasoon",
+    description="Active ou désactive le mode Media Soon (bloque l'ouverture des tickets)"
+)
+@app_commands.describe(etat="Activer bloque les tickets, Désactiver les rouvre")
+@app_commands.choices(etat=[
+    app_commands.Choice(name="Activer",  value="on"),
+    app_commands.Choice(name="Désactiver", value="off"),
+])
+@app_commands.checks.has_permissions(administrator=True)
+async def mediasoon(interaction: discord.Interaction, etat: app_commands.Choice[str]):
+    global media_soon_enabled
+    media_soon_enabled = etat.value == "on"
+
+    if media_soon_enabled:
+        await interaction.response.send_message(
+            "🔒 **Media Soon activé** — les clients ne peuvent plus ouvrir de tickets.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            "✅ **Media Soon désactivé** — les tickets sont à nouveau ouverts.",
+            ephemeral=True,
+        )
+
+
+@mediasoon.error
+async def mediasoon_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
             "❌ Tu dois avoir la permission **Administrateur** pour utiliser cette commande.",
