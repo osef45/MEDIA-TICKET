@@ -29,7 +29,6 @@ intents.members         = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Mode "Media Soon" — bloque l'ouverture de nouveaux tickets
 media_soon_enabled = False
 notify_cooldowns: dict[int, float] = {}
 
@@ -50,7 +49,7 @@ def find_user_ticket(category: discord.CategoryChannel, user_id: int) -> discord
     for ch in category.channels:
         if not isinstance(ch, discord.TextChannel):
             continue
-        if ch.topic and f"ID : {user_id}" in ch.topic:
+        if ch.topic and (f"ID: {user_id}" in ch.topic or f"ID : {user_id}" in ch.topic):
             return ch
         if ch.name == f"ticket-{user_id}":
             return ch
@@ -58,19 +57,22 @@ def find_user_ticket(category: discord.CategoryChannel, user_id: int) -> discord
 
 
 def get_claimed_staff_id(topic: str | None) -> int | None:
-    if not topic or "Pris en charge :" not in topic:
+    if not topic:
         return None
-    match = re.search(r"Pris en charge : (\d+)", topic)
-    return int(match.group(1)) if match else None
+    for pattern in (r"Claimed by: (\d+)", r"Pris en charge : (\d+)"):
+        match = re.search(pattern, topic)
+        if match:
+            return int(match.group(1))
+    return None
 
 
 async def create_ticket_channel(
     guild: discord.Guild,
     user: discord.Member,
-    plateformes: str,
-    type_contenu: str,
+    platforms: str,
+    content_type: str,
     description: str,
-    liens: str,
+    links: str,
 ) -> discord.TextChannel | None:
     category = guild.get_channel(TICKET_CATEGORY_ID)
     if category is None:
@@ -100,34 +102,34 @@ async def create_ticket_channel(
     channel = await guild.create_text_channel(
         name=f"ticket-{user.id}",
         category=category,
-        topic=f"Ticket de {user} | ID : {user.id}",
+        topic=f"Ticket by {user} | ID: {user.id}",
         overwrites=overwrites,
     )
 
     embed = discord.Embed(
-        title="🎬  Demande Média",
-        description=f"Nouvelle demande de {user.mention}",
+        title="🎬  Media Request",
+        description=f"New request from {user.mention}",
         color=0x5865F2,
         timestamp=datetime.datetime.utcnow(),
     )
-    embed.add_field(name="📱  Plateformes",     value=plateformes,   inline=False)
-    embed.add_field(name="🎥  Type de contenu", value=type_contenu,  inline=False)
-    embed.add_field(name="📝  Description",      value=description, inline=False)
-    if liens.strip():
-        embed.add_field(name="🔗  Liens / pseudos", value=liens, inline=False)
+    embed.add_field(name="📱  Platforms",     value=platforms,      inline=False)
+    embed.add_field(name="🎥  Content type", value=content_type,   inline=False)
+    embed.add_field(name="📝  Description",   value=description,    inline=False)
+    if links.strip():
+        embed.add_field(name="🔗  Links / handles", value=links, inline=False)
     embed.add_field(
-        name="📊  Statistiques",
-        value="Envoie ta **capture d'écran de stats en direct** dans ce salon (TikTok, Instagram, YouTube…).",
+        name="📊  Statistics",
+        value="Send a **live stats screenshot** in this channel (TikTok, Instagram, YouTube…).",
         inline=False,
     )
-    embed.add_field(name="✋  Prise en charge", value="En attente du staff…", inline=False)
+    embed.add_field(name="✋  Assigned to", value="Waiting for staff…", inline=False)
     embed.set_footer(text="Media Ticket System")
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
 
     mention_text = staff_role.mention if staff_role else "@Staff"
     msg = await channel.send(
-        content=f"{mention_text} — nouveau ticket de {user.mention} !",
+        content=f"{mention_text} — new ticket from {user.mention}!",
         embed=embed,
         view=TicketView(),
         allowed_mentions=discord.AllowedMentions(roles=True, users=True),
@@ -137,17 +139,16 @@ async def create_ticket_channel(
 
 
 # ══════════════════════════════════════════════════════════════
-#  VIEW — Ticket inside (Notify + Close)
+#  VIEW — Ticket inside (Notify + Claim + Close)
 # ══════════════════════════════════════════════════════════════
 class TicketView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    # ── Notify ────────────────────────────────────────────────
     @discord.ui.button(
-        label="🔔  Notifier le Staff",
+        label="🔔  Notify Staff",
         style=discord.ButtonStyle.secondary,
-        custom_id="media_ticket:notify"
+        custom_id="media_ticket:notify",
     )
     async def notify(self, interaction: discord.Interaction, button: discord.ui.Button):
         channel_id = interaction.channel_id
@@ -158,7 +159,7 @@ class TicketView(discord.ui.View):
         if remaining > 0:
             mins = max(1, int(remaining // 60 + (1 if remaining % 60 else 0)))
             await interaction.response.send_message(
-                f"⏳ Tu pourras notifier le staff à nouveau dans **{mins} min**.",
+                f"⏳ You can notify staff again in **{mins} min**.",
                 ephemeral=True,
             )
             return
@@ -167,13 +168,12 @@ class TicketView(discord.ui.View):
         staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
         mention    = staff_role.mention if staff_role else "@Staff"
         await interaction.response.send_message(
-            f"🔔 {mention} — {interaction.user.mention} a besoin d'assistance !",
+            f"🔔 {mention} — {interaction.user.mention} needs assistance!",
             allowed_mentions=discord.AllowedMentions(roles=True, users=True),
         )
 
-    # ── Claim ─────────────────────────────────────────────────
     @discord.ui.button(
-        label="✋  Prendre en charge",
+        label="✋  Claim Ticket",
         style=discord.ButtonStyle.success,
         custom_id="media_ticket:claim",
     )
@@ -183,7 +183,7 @@ class TicketView(discord.ui.View):
 
         if not is_staff(interaction.user, guild):
             await interaction.response.send_message(
-                "❌ Seul le staff peut prendre en charge un ticket.", ephemeral=True
+                "❌ Only staff can claim a ticket.", ephemeral=True
             )
             return
 
@@ -191,23 +191,23 @@ class TicketView(discord.ui.View):
         if claimed_id is not None:
             if claimed_id == interaction.user.id:
                 await interaction.response.send_message(
-                    "ℹ️ Tu as déjà pris en charge ce ticket.", ephemeral=True
+                    "ℹ️ You have already claimed this ticket.", ephemeral=True
                 )
             else:
                 claimer = guild.get_member(claimed_id)
                 name    = claimer.mention if claimer else f"<@{claimed_id}>"
                 await interaction.response.send_message(
-                    f"❌ Ce ticket est déjà pris en charge par {name}.", ephemeral=True
+                    f"❌ This ticket is already claimed by {name}.", ephemeral=True
                 )
             return
 
         await interaction.response.defer()
 
         base_topic = channel.topic or ""
-        new_topic  = f"{base_topic} | Pris en charge : {interaction.user.id}"
+        new_topic  = f"{base_topic} | Claimed by: {interaction.user.id}"
         await channel.edit(topic=new_topic)
 
-        user_id_match = re.search(r"ID : (\d+)", base_topic)
+        user_id_match = re.search(r"ID:?\s*(\d+)", base_topic)
         user_slug     = "user"
         if user_id_match:
             owner = guild.get_member(int(user_id_match.group(1)))
@@ -218,8 +218,8 @@ class TicketView(discord.ui.View):
         await channel.edit(name=f"ticket-{user_slug}-{staff_slug}")
 
         claim_embed = discord.Embed(
-            title="✋  Ticket pris en charge",
-            description=f"{interaction.user.mention} s'occupe de cette demande.",
+            title="✋  Ticket Claimed",
+            description=f"{interaction.user.mention} is handling this request.",
             color=0x57F287,
             timestamp=datetime.datetime.utcnow(),
         )
@@ -231,10 +231,10 @@ class TicketView(discord.ui.View):
                 embed = pin.embeds[0]
                 new_embed = embed.copy()
                 for i, field in enumerate(new_embed.fields):
-                    if field.name == "✋  Prise en charge":
+                    if field.name in ("✋  Assigned to", "✋  Prise en charge"):
                         new_embed.set_field_at(
                             i,
-                            name="✋  Prise en charge",
+                            name="✋  Assigned to",
                             value=f"{interaction.user.mention}",
                             inline=False,
                         )
@@ -242,62 +242,59 @@ class TicketView(discord.ui.View):
                 await pin.edit(embed=new_embed)
                 break
 
-    # ── Close ─────────────────────────────────────────────────
     @discord.ui.button(
-        label="🔒  Fermer le Ticket",
+        label="🔒  Close Ticket",
         style=discord.ButtonStyle.danger,
-        custom_id="media_ticket:close"
+        custom_id="media_ticket:close",
     )
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
 
         if not is_staff(interaction.user, guild):
             await interaction.response.send_message(
-                "❌ Seul le staff peut fermer un ticket.", ephemeral=True
+                "❌ Only staff can close a ticket.", ephemeral=True
             )
             return
 
         await interaction.response.defer()
         channel = interaction.channel
 
-        # ── Closing notice ─────────────────────────────────────
         close_embed = discord.Embed(
-            title="🔒  Fermeture du ticket",
+            title="🔒  Closing Ticket",
             description=(
-                f"Ticket fermé par {interaction.user.mention}.\n"
-                "Génération de la transcription…"
+                f"Ticket closed by {interaction.user.mention}.\n"
+                "Generating transcript…"
             ),
             color=0xED4245,
             timestamp=datetime.datetime.utcnow(),
         )
         await channel.send(embed=close_embed)
 
-        # ── Build .txt transcript ──────────────────────────────
         lines = [
             "╔══════════════════════════════════════════════════════════╗",
-            "║               TRANSCRIPTION — MEDIA TICKET               ║",
+            "║               TRANSCRIPT — MEDIA TICKET                  ║",
             "╚══════════════════════════════════════════════════════════╝",
             f"  Ticket    : {channel.name}",
-            f"  Serveur   : {guild.name} ({guild.id})",
-            f"  Fermé par : {interaction.user} ({interaction.user.id})",
-            f"  Date      : {datetime.datetime.utcnow().strftime('%d/%m/%Y à %H:%M:%S')} UTC",
+            f"  Server    : {guild.name} ({guild.id})",
+            f"  Closed by : {interaction.user} ({interaction.user.id})",
+            f"  Date      : {datetime.datetime.utcnow().strftime('%m/%d/%Y at %H:%M:%S')} UTC",
             "─" * 62,
         ]
 
         async for msg in channel.history(limit=None, oldest_first=True):
-            ts     = msg.created_at.strftime("%d/%m/%Y %H:%M:%S")
+            ts     = msg.created_at.strftime("%m/%d/%Y %H:%M:%S")
             author = f"{msg.author} ({msg.author.id})"
             lines.append(f"[{ts}] {author}")
             if msg.content:
                 lines.append(f"  ➜ {msg.content}")
             for att in msg.attachments:
-                lines.append(f"  📎 Pièce jointe : {att.url}")
+                lines.append(f"  📎 Attachment: {att.url}")
             if msg.embeds:
-                lines.append(f"  📌 [Embed envoyé]")
+                lines.append("  📌 [Embed sent]")
             lines.append("")
 
         lines.append("─" * 62)
-        lines.append("Fin de la transcription.")
+        lines.append("End of transcript.")
 
         transcript_bytes = "\n".join(lines).encode("utf-8")
         filename = (
@@ -305,17 +302,20 @@ class TicketView(discord.ui.View):
             f"{datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.txt"
         )
 
-        # ── Send transcript to dedicated channel ───────────────
         trans_channel = guild.get_channel(TRANSCRIPT_CHANNEL_ID)
         if trans_channel:
             t_embed = discord.Embed(
-                title="📄  Nouvelle Transcription",
+                title="📄  New Transcript",
                 color=0x57F287,
                 timestamp=datetime.datetime.utcnow(),
             )
-            t_embed.add_field(name="📁 Ticket",    value=f"`{channel.name}`",                          inline=True)
-            t_embed.add_field(name="🔒 Fermé par", value=f"{interaction.user.mention}",                inline=True)
-            t_embed.add_field(name="📅 Date",      value=datetime.datetime.utcnow().strftime("%d/%m/%Y %H:%M"), inline=True)
+            t_embed.add_field(name="📁 Ticket",     value=f"`{channel.name}`",           inline=True)
+            t_embed.add_field(name="🔒 Closed by", value=f"{interaction.user.mention}", inline=True)
+            t_embed.add_field(
+                name="📅 Date",
+                value=datetime.datetime.utcnow().strftime("%m/%d/%Y %H:%M"),
+                inline=True,
+            )
             t_embed.set_footer(text="Media Ticket System")
             await trans_channel.send(
                 embed=t_embed,
@@ -323,35 +323,35 @@ class TicketView(discord.ui.View):
             )
 
         await asyncio.sleep(5)
-        await channel.delete(reason=f"Ticket fermé par {interaction.user}")
+        await channel.delete(reason=f"Ticket closed by {interaction.user}")
 
 
 # ══════════════════════════════════════════════════════════════
 #  MODAL — Ticket opening form
 # ══════════════════════════════════════════════════════════════
-class TicketOpenModal(discord.ui.Modal, title="🎬  Demande Média"):
-    plateformes = discord.ui.TextInput(
-        label="Plateformes actives",
-        placeholder="Ex: TikTok, Instagram, YouTube, Twitch…",
+class TicketOpenModal(discord.ui.Modal, title="🎬  Media Request"):
+    platforms = discord.ui.TextInput(
+        label="Active platforms",
+        placeholder="e.g. TikTok, Instagram, YouTube, Twitch…",
         max_length=200,
         required=True,
     )
-    type_contenu = discord.ui.TextInput(
-        label="Type de contenu",
-        placeholder="Vidéos, Live, Autre…",
+    content_type = discord.ui.TextInput(
+        label="Content type",
+        placeholder="Videos, Live, Other…",
         max_length=100,
         required=True,
     )
     description = discord.ui.TextInput(
-        label="Description de ta demande",
-        placeholder="Partenariat, promotion, visibilité…",
+        label="Request description",
+        placeholder="Partnership, promotion, visibility…",
         style=discord.TextStyle.paragraph,
         max_length=500,
         required=True,
     )
-    liens = discord.ui.TextInput(
-        label="Liens / pseudos (optionnel)",
-        placeholder="Liens vers tes profils ou @pseudos",
+    links = discord.ui.TextInput(
+        label="Links / handles (optional)",
+        placeholder="Links to your profiles or @handles",
         style=discord.TextStyle.paragraph,
         max_length=400,
         required=False,
@@ -363,14 +363,14 @@ class TicketOpenModal(discord.ui.Modal, title="🎬  Demande Média"):
 
         if category is None:
             await interaction.response.send_message(
-                "❌ Catégorie introuvable. Contacte un administrateur.", ephemeral=True
+                "❌ Category not found. Contact an administrator.", ephemeral=True
             )
             return
 
         existing = find_user_ticket(category, interaction.user.id)
         if existing:
             await interaction.response.send_message(
-                f"❌ Tu as déjà un ticket ouvert : {existing.mention}", ephemeral=True
+                f"❌ You already have an open ticket: {existing.mention}", ephemeral=True
             )
             return
 
@@ -379,20 +379,20 @@ class TicketOpenModal(discord.ui.Modal, title="🎬  Demande Média"):
         channel = await create_ticket_channel(
             guild,
             interaction.user,
-            self.plateformes.value,
-            self.type_contenu.value,
+            self.platforms.value,
+            self.content_type.value,
             self.description.value,
-            self.liens.value or "",
+            self.links.value or "",
         )
 
         if channel is None:
             await interaction.followup.send(
-                "❌ Impossible de créer le ticket. Contacte un administrateur.", ephemeral=True
+                "❌ Could not create the ticket. Contact an administrator.", ephemeral=True
             )
             return
 
         await interaction.followup.send(
-            f"✅ Ton ticket a été ouvert : {channel.mention}", ephemeral=True
+            f"✅ Your ticket has been opened: {channel.mention}", ephemeral=True
         )
 
 
@@ -404,17 +404,17 @@ class TicketPanelView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="📩  Ouvrir un Ticket",
+        label="📩  Open a Ticket",
         style=discord.ButtonStyle.primary,
-        custom_id="media_ticket:open"
+        custom_id="media_ticket:open",
     )
     async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         if media_soon_enabled:
             embed = discord.Embed(
                 title="🎬  Media Soon",
                 description=(
-                    "Les tickets média ne sont pas encore ouverts.\n"
-                    "Reviens bientôt, on te préviendra dès que c'est disponible !"
+                    "Media tickets are not open yet.\n"
+                    "Check back soon — we'll let you know when they're available!"
                 ),
                 color=0xFEE75C,
                 timestamp=datetime.datetime.utcnow(),
@@ -430,14 +430,14 @@ class TicketPanelView(discord.ui.View):
 
         if category is None:
             await interaction.response.send_message(
-                "❌ Catégorie introuvable. Contacte un administrateur.", ephemeral=True
+                "❌ Category not found. Contact an administrator.", ephemeral=True
             )
             return
 
         existing = find_user_ticket(category, interaction.user.id)
         if existing:
             await interaction.response.send_message(
-                f"❌ Tu as déjà un ticket ouvert : {existing.mention}", ephemeral=True
+                f"❌ You already have an open ticket: {existing.mention}", ephemeral=True
             )
             return
 
@@ -449,17 +449,16 @@ class TicketPanelView(discord.ui.View):
 # ──────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    # Register persistent views so buttons keep working after restarts
     bot.add_view(TicketPanelView())
     bot.add_view(TicketView())
 
     try:
         synced = await bot.tree.sync()
-        print(f"✅  {len(synced)} commande(s) slash synchronisée(s)")
+        print(f"✅  {len(synced)} slash command(s) synced")
     except Exception as e:
-        print(f"❌  Erreur de synchronisation : {e}")
+        print(f"❌  Sync error: {e}")
 
-    print(f"✅  Bot connecté : {bot.user} ({bot.user.id})")
+    print(f"✅  Bot connected: {bot.user} ({bot.user.id})")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -467,32 +466,32 @@ async def on_ready():
 # ──────────────────────────────────────────────────────────────
 @bot.tree.command(
     name="setup",
-    description="Déploie le panel de tickets média dans ce salon"
+    description="Deploy the media ticket panel in this channel",
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def setup(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🎬  Media Ticket",
         description=(
-            "**Bienvenue sur le système de tickets Média !**\n\n"
-            "Tu veux collaborer avec nous ou obtenir de la visibilité ?\n"
-            "Clique sur le bouton ci-dessous pour remplir le formulaire\n"
-            "et notre équipe te répondra dans les plus brefs délais.\n\n"
-            "**Tu auras besoin de :**\n"
-            "┣ 📱  Tes plateformes actives\n"
-            "┣ 🎥  Le type de contenu (vidéos / live)\n"
-            "┣ 📝  Une description de ta demande\n"
-            "┗ 📊  Une capture de tes stats (à envoyer dans le ticket)"
+            "**Welcome to the Media Ticket system!**\n\n"
+            "Want to collaborate with us or get visibility?\n"
+            "Click the button below to fill out the form\n"
+            "and our team will get back to you as soon as possible.\n\n"
+            "**You'll need:**\n"
+            "┣ 📱  Your active platforms\n"
+            "┣ 🎥  Content type (videos / live)\n"
+            "┣ 📝  A description of your request\n"
+            "┗ 📊  A stats screenshot (to send in the ticket)"
         ),
         color=0x5865F2,
     )
-    embed.set_footer(text="Media Ticket System • Clique sur le bouton pour commencer")
+    embed.set_footer(text="Media Ticket System • Click the button to get started")
     if interaction.guild.icon:
         embed.set_thumbnail(url=interaction.guild.icon.url)
 
     await interaction.channel.send(embed=embed, view=TicketPanelView())
     await interaction.response.send_message(
-        "✅ Panel de tickets déployé avec succès !", ephemeral=True
+        "✅ Ticket panel deployed successfully!", ephemeral=True
     )
 
 
@@ -500,7 +499,7 @@ async def setup(interaction: discord.Interaction):
 async def setup_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
-            "❌ Tu dois avoir la permission **Administrateur** pour utiliser cette commande.",
+            "❌ You need **Administrator** permission to use this command.",
             ephemeral=True,
         )
 
@@ -510,26 +509,26 @@ async def setup_error(interaction: discord.Interaction, error: app_commands.AppC
 # ──────────────────────────────────────────────────────────────
 @bot.tree.command(
     name="mediasoon",
-    description="Active ou désactive le mode Media Soon (bloque l'ouverture des tickets)"
+    description="Enable or disable Media Soon mode (blocks ticket creation)",
 )
-@app_commands.describe(etat="Activer bloque les tickets, Désactiver les rouvre")
-@app_commands.choices(etat=[
-    app_commands.Choice(name="Activer",  value="on"),
-    app_commands.Choice(name="Désactiver", value="off"),
+@app_commands.describe(state="Enable blocks tickets, Disable reopens them")
+@app_commands.choices(state=[
+    app_commands.Choice(name="Enable",  value="on"),
+    app_commands.Choice(name="Disable", value="off"),
 ])
 @app_commands.checks.has_permissions(administrator=True)
-async def mediasoon(interaction: discord.Interaction, etat: app_commands.Choice[str]):
+async def mediasoon(interaction: discord.Interaction, state: app_commands.Choice[str]):
     global media_soon_enabled
-    media_soon_enabled = etat.value == "on"
+    media_soon_enabled = state.value == "on"
 
     if media_soon_enabled:
         await interaction.response.send_message(
-            "🔒 **Media Soon activé** — les clients ne peuvent plus ouvrir de tickets.",
+            "🔒 **Media Soon enabled** — users can no longer open tickets.",
             ephemeral=True,
         )
     else:
         await interaction.response.send_message(
-            "✅ **Media Soon désactivé** — les tickets sont à nouveau ouverts.",
+            "✅ **Media Soon disabled** — tickets are open again.",
             ephemeral=True,
         )
 
@@ -538,7 +537,7 @@ async def mediasoon(interaction: discord.Interaction, etat: app_commands.Choice[
 async def mediasoon_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
-            "❌ Tu dois avoir la permission **Administrateur** pour utiliser cette commande.",
+            "❌ You need **Administrator** permission to use this command.",
             ephemeral=True,
         )
 
@@ -547,6 +546,6 @@ async def mediasoon_error(interaction: discord.Interaction, error: app_commands.
 #  Entry point
 # ──────────────────────────────────────────────────────────────
 if TOKEN is None:
-    raise ValueError("❌  La variable d'environnement DISCORD_TOKEN est manquante.")
+    raise ValueError("❌  DISCORD_TOKEN environment variable is missing.")
 
 bot.run(TOKEN)
