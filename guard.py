@@ -40,6 +40,10 @@ C_GRAY, C_DARKRED, C_TEAL = 0x99AAB5, 0x992D22, 0x1ABC9C
 _log = logging.getLogger("guard")
 
 
+def _print(*args) -> None:
+    print(*args, flush=True)  # visible tout de suite dans les logs Railway
+
+
 def _ids(raw) -> list[int]:
     if raw is None:
         return []
@@ -197,7 +201,7 @@ class Guard:
                 self.copies = self._mongo[os.getenv("GUARD_DB", "bot_guard").strip() or "bot_guard"]["log_copies"]
                 self.storage = "MongoDB"
             except Exception as e:  # pymongo absent ou URI invalide : on garde la mémoire
-                print(f"[guard] MongoDB indisponible, copies en mémoire : {e}")
+                _print(f"[guard] MongoDB indisponible, copies en mémoire : {e}")
         self._audit_seen: dict[int, int] = {}
         self._pending: list = []
         self._started = False
@@ -222,6 +226,9 @@ class Guard:
             return original_dispatch(event_name, *args, **kwargs)
 
         bot.dispatch = dispatch
+        # discord.py garde sa propre référence à dispatch (prise à la création du bot) : c'est elle
+        # qui reçoit les événements de Discord (ready, messages, suppressions…).
+        bot._connection.dispatch = dispatch
 
         http = bot.http
         original_delete, original_bulk = http.delete_message, http.delete_messages
@@ -255,7 +262,7 @@ class Guard:
 
             parsers["INTERACTION_CREATE"] = parse_interaction_create
         else:
-            print("[guard] ⚠️ interactions non filtrées (version de discord.py inattendue)")
+            _print("[guard] ⚠️ interactions non filtrées (version de discord.py inattendue)")
 
         tree = getattr(bot, "tree", None) or getattr(state, "_command_tree", None)
         if tree is not None:
@@ -281,7 +288,7 @@ class Guard:
         try:
             await coro
         except Exception as e:  # la protection ne doit jamais faire tomber le bot
-            print(f"[guard] erreur interne : {e!r}")
+            _print(f"[guard] erreur interne : {e!r}")
 
     # ─── Envoi ────────────────────────────────────────────────
     def card(self, title: str, color: int, category: str) -> Card:
@@ -301,7 +308,7 @@ class Guard:
                 await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
                 sent = True
             except discord.DiscordException as e:
-                print(f"[guard] log impossible dans {self.watch_id} : {e}")
+                _print(f"[guard] log impossible dans {self.watch_id} : {e}")
         if alert or (not sent and important):
             if not sent:
                 embed = embed.copy()
@@ -316,7 +323,7 @@ class Guard:
                     user = await self.bot.fetch_user(user_id)
                 await user.send(embed=embed)
             except discord.DiscordException as e:
-                print(f"[guard] alerte MP impossible pour {user_id} : {e}")
+                _print(f"[guard] alerte MP impossible pour {user_id} : {e}")
 
     # ─── Démarrage et verrou serveur ──────────────────────────
     async def _on_ready(self, *args) -> None:
@@ -351,7 +358,7 @@ class Guard:
         log.line("Qui supprime un log", "✅ identifié (logs d'audit)" if audit_ok else "⚠️ il manque la permission « Voir les logs du serveur »")
         log.line("Surveillance", "✅ chaque commande, bouton, formulaire et erreur" if self.surveillance else "désactivée")
         log.line("Alertes en MP", " ".join(f"<@{u}>" for u in self.alert_ids) or "—")
-        print(f"[guard] {self.name} protégé · serveurs {self.guild_ids} · logs {sorted(self.protect)} · {self.storage} · audit {'OK' if audit_ok else 'manquant'}")
+        _print(f"[guard] {self.name} protégé · serveurs {self.guild_ids} · logs {sorted(self.protect)} · {self.storage} · audit {'OK' if audit_ok else 'manquant'}")
         await self.send(log)
 
     async def _on_guild_join(self, guild) -> None:
@@ -360,7 +367,7 @@ class Guard:
     async def _enforce(self, guild) -> None:
         if guild.id in self.guild_ids:
             return
-        print(f"[guard] serveur non autorisé {guild.name} ({guild.id}) : départ")
+        _print(f"[guard] serveur non autorisé {guild.name} ({guild.id}) : départ")
         try:
             await guild.leave()
         except discord.HTTPException:
@@ -462,7 +469,7 @@ class Guard:
                 await asyncio.to_thread(self.copies.replace_one, {"_id": message.id}, doc, upsert=True)
                 return
             except Exception as e:
-                print(f"[guard] copie MongoDB impossible, gardée en mémoire : {e}")
+                _print(f"[guard] copie MongoDB impossible, gardée en mémoire : {e}")
         self.memory[message.id] = doc
         while len(self.memory) > MAX_MEMORY_COPIES:
             self.memory.popitem(last=False)
@@ -473,7 +480,7 @@ class Guard:
             try:
                 doc = await asyncio.to_thread(self.copies.find_one_and_delete, {"_id": message_id})
             except Exception as e:
-                print(f"[guard] copie {message_id} illisible : {e}")
+                _print(f"[guard] copie {message_id} illisible : {e}")
         return doc
 
     def _is_log_deletion(self, entry) -> bool:
@@ -513,9 +520,9 @@ class Guard:
             if self._pending:
                 return self._pending.pop(0)
         except discord.Forbidden:
-            print("[guard] permission « Voir les logs du serveur » manquante : auteur inconnu")
+            _print("[guard] permission « Voir les logs du serveur » manquante : auteur inconnu")
         except Exception as e:
-            print(f"[guard] logs d'audit illisibles : {e}")
+            _print(f"[guard] logs d'audit illisibles : {e}")
         return None
 
     async def _on_raw_message_delete(self, payload) -> None:
@@ -558,7 +565,7 @@ class Guard:
                 await channel.send(content=content[:2000] or None, embeds=embeds, files=files, allowed_mentions=discord.AllowedMentions.none())
                 restored += 1
             except (discord.DiscordException, AttributeError) as e:
-                print(f"[guard] restauration impossible : {e}")
+                _print(f"[guard] restauration impossible : {e}")
                 lost += 1
                 continue
             title = (embeds[0].title if embeds else None) or (doc.get("content") or "").split("\n")[0][:80]
