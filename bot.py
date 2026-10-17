@@ -1,4 +1,6 @@
 import discord
+
+import guard
 from discord.ext import commands
 from discord import app_commands
 import asyncio
@@ -548,4 +550,6 @@ async def mediasoon_error(interaction: discord.Interaction, error: app_commands.
 if TOKEN is None:
     raise ValueError("❌  DISCORD_TOKEN environment variable is missing.")
 
+# Protection commune (guard.py) : verrou serveur, logs impossibles à effacer, alertes MP, surveillance.
+guard.install(bot, name="Media Ticket", guild_ids=[1485021520160886784], protect=[TRANSCRIPT_CHANNEL_ID])
 bot.run(TOKEN)
