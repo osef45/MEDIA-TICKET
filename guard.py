@@ -178,7 +178,7 @@ def _component_label(data: dict) -> str:
 
 
 class Guard:
-    def __init__(self, bot, *, name: str, guild_ids, protect=(), watch=None, alert_user_ids=None) -> None:
+    def __init__(self, bot, *, name: str, guild_ids, protect=(), watch=None, alert_user_ids=None, announce=True) -> None:
         self.bot = bot
         self.name = name
         self.guild_ids = _env_ids("GUARD_GUILD_IDS", guild_ids)
@@ -205,6 +205,10 @@ class Guard:
         self._audit_seen: dict[int, int] = {}
         self._pending: list = []
         self._started = False
+        self.auto_announce = announce  # False : le bot appelle lui-même bot.guard.announce(extra=...)
+        self._announced = False
+        self._audit_ok = False
+        self._setup_done = asyncio.Event()
         self._recent_errors: dict[str, float] = {}
         self._self_deleted: set[int] = set()  # messages que le bot supprime lui-même
 
@@ -225,6 +229,7 @@ class Guard:
                 self._spawn(handler(*args))
             return original_dispatch(event_name, *args, **kwargs)
 
+        bot.guard = self  # le bot peut appeler bot.guard.announce(extra=[...]) dans son on_ready
         bot.dispatch = dispatch
         # discord.py garde sa propre référence à dispatch (prise à la création du bot) : c'est elle
         # qui reçoit les événements de Discord (ready, messages, suppressions…).
@@ -299,23 +304,30 @@ class Guard:
         Salon introuvable ou fermé : un log important part en MP pour ne pas être perdu
         (la simple surveillance non, pour ne pas inonder les MP)."""
         embed = log.embed() if isinstance(log, Card) else log
+        # Alerte : les MP d'abord ; ceux qui ne peuvent pas recevoir de MP sont mentionnés dans le salon.
+        failed = await self.alert_dm(embed) if alert else []
         sent = False
         if self.watch_id:
             channel = self.bot.get_channel(self.watch_id)
+            content, mentions = None, discord.AllowedMentions.none()
+            if failed:
+                content = "🔔 " + " ".join(f"<@{u}>" for u in failed) + " · alerte pas reçue en MP (MP fermés aux bots) : la voici."
+                mentions = discord.AllowedMentions(users=[discord.Object(id=u) for u in failed], roles=False, everyone=False)
             try:
                 if channel is None:
                     channel = await self.bot.fetch_channel(self.watch_id)
-                await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                await channel.send(content=content, embed=embed, allowed_mentions=mentions)
                 sent = True
             except discord.DiscordException as e:
                 _print(f"[guard] log impossible dans {self.watch_id} : {e}")
-        if alert or (not sent and important):
-            if not sent:
-                embed = embed.copy()
-                embed.set_footer(text=f"📭 Salon de logs inaccessible · {embed.footer.text or ''}")
+        if not sent and important and not alert:
+            embed = embed.copy()
+            embed.set_footer(text=f"📭 Salon de logs inaccessible · {embed.footer.text or ''}")
             await self.alert_dm(embed)
 
-    async def alert_dm(self, embed: discord.Embed) -> None:
+    async def alert_dm(self, embed: discord.Embed) -> list[int]:
+        """MP à chaque personne d'alerte. Retourne ceux qui n'ont pas pu le recevoir."""
+        failed = []
         for user_id in self.alert_ids:
             user = self.bot.get_user(user_id)
             try:
@@ -323,7 +335,9 @@ class Guard:
                     user = await self.bot.fetch_user(user_id)
                 await user.send(embed=embed)
             except discord.DiscordException as e:
+                failed.append(user_id)
                 _print(f"[guard] alerte MP impossible pour {user_id} : {e}")
+        return failed
 
     # ─── Démarrage et verrou serveur ──────────────────────────
     async def _on_ready(self, *args) -> None:
@@ -347,6 +361,27 @@ class Guard:
             me = guild.me
             audit_ok = audit_ok and bool(me and me.guild_permissions.view_audit_log)
             await self._prime_audit(guild)
+        self._audit_ok = audit_ok
+        self._setup_done.set()
+        _print(f"[guard] {self.name} protégé · serveurs {self.guild_ids} · logs {sorted(self.protect)} · {self.storage} · audit {'OK' if audit_ok else 'manquant'}")
+        if self.auto_announce:
+            await self.announce()
+        else:  # le bot annonce lui-même son démarrage (avec ses infos) ; sinon on le fait au bout d'1 min
+            self._spawn(self._announce_fallback())
+
+    async def _announce_fallback(self) -> None:
+        await asyncio.sleep(60)
+        await self.announce()
+
+    async def announce(self, extra=()) -> None:
+        """Message de démarrage unique : état des protections + infos du bot (extra = [(libellé, valeur)])."""
+        if self._announced:
+            return
+        self._announced = True
+        try:
+            await asyncio.wait_for(self._setup_done.wait(), timeout=60)
+        except asyncio.TimeoutError:
+            pass
         servers = ", ".join(
             f"**{g.name}**" if (g := self.bot.get_guild(gid)) else f"`{gid}`" for gid in self.guild_ids
         )
@@ -355,10 +390,12 @@ class Guard:
         log.line("Verrou serveur", f"✅ uniquement {servers}")
         log.line("Logs protégés", " ".join(f"<#{c}>" for c in sorted(self.protect)) or "—")
         log.line("Copies des logs", self.storage)
-        log.line("Qui supprime un log", "✅ identifié (logs d'audit)" if audit_ok else "⚠️ il manque la permission « Voir les logs du serveur »")
+        log.line("Qui supprime un log", "✅ identifié (logs d'audit)" if self._audit_ok else "⚠️ il manque la permission « Voir les logs du serveur »")
         log.line("Surveillance", "✅ chaque commande, bouton, formulaire et erreur" if self.surveillance else "désactivée")
         log.line("Alertes en MP", " ".join(f"<@{u}>" for u in self.alert_ids) or "—")
-        _print(f"[guard] {self.name} protégé · serveurs {self.guild_ids} · logs {sorted(self.protect)} · {self.storage} · audit {'OK' if audit_ok else 'manquant'}")
+        extra = [(label, value) for label, value in extra if value not in (None, "")]
+        if extra:
+            log.section("ℹ️ Le bot", "\n".join(f"> **{label}** · {value}" for label, value in extra))
         await self.send(log)
 
     async def _on_guild_join(self, guild) -> None:
@@ -656,6 +693,7 @@ class _ErrorHandler(logging.Handler):
         self.guard._spawn(self.guard.log_error(record.getMessage()[:200], error))
 
 
-def install(bot, *, name: str, guild_ids, protect=(), watch=None, alert_user_ids=None) -> Guard:
+def install(bot, *, name: str, guild_ids, protect=(), watch=None, alert_user_ids=None, announce=True) -> Guard:
     """Active toutes les protections sur ce bot. À appeler une fois, juste avant bot.run()."""
-    return Guard(bot, name=name, guild_ids=guild_ids, protect=protect, watch=watch, alert_user_ids=alert_user_ids).install()
+    """announce=False : le bot poste lui-même son message de démarrage avec bot.guard.announce(extra=[...])."""
+    return Guard(bot, name=name, guild_ids=guild_ids, protect=protect, watch=watch, alert_user_ids=alert_user_ids, announce=announce).install()
