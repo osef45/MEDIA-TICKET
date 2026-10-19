@@ -1,7 +1,7 @@
 import discord
 
 import guard
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import asyncio
 import os
@@ -21,6 +21,15 @@ STAFF_ROLE_ID         = 1485025940257112164
 TRANSCRIPT_CHANNEL_ID = 1485083648641208410
 TICKET_CATEGORY_ID    = 1485031875931148462
 NOTIFY_COOLDOWN_SEC   = 900  # 15 minutes
+# Fermeture automatique : heures sans message humain avant fermeture (variable Railway ; 0 = désactivé)
+TICKET_INACTIVITY_HOURS = int(os.getenv("TICKET_INACTIVITY_HOURS", "24") or 0)
+TICKET_INACTIVITY_CHECK_MINUTES = 10                    # Fréquence de la vérification d'inactivité
+# Alerte avant fermeture : heures d'inactivité avant d'avertir le créateur (variable Railway ; 0 = pas d'alerte)
+TICKET_INACTIVITY_WARN_HOURS = int(os.getenv("TICKET_INACTIVITY_WARN_HOURS", "12") or 0)
+INACTIVITY_WARNING_TITLE = "⚠️ Inactive ticket"          # Titre de l'avis posté dans le ticket (sert aussi de marqueur)
+# Salon du panneau, cible des liens « rouvrir un ticket » (variable Railway ; sinon /setup, sinon détection)
+TICKET_PANEL_CHANNEL_ID = int(os.getenv("TICKET_PANEL_CHANNEL_ID", "0") or 0)
+PANEL_BUTTON_CUSTOM_ID  = "media_ticket:open"
 
 # ──────────────────────────────────────────────────────────────
 #  Bot setup
@@ -33,6 +42,10 @@ bot = commands.Bot(command_prefix="!", intents=intents, status=discord.Status.on
 
 media_soon_enabled = False
 notify_cooldowns: dict[int, float] = {}
+# Un seul flux de fermeture par salon (double clic, fermeture auto en parallèle)
+_ticket_close_locks: dict[int, asyncio.Lock] = {}
+# Salon du panneau par serveur : {guild_id: channel_id}
+_panel_channel_cache: dict[int, int] = {}
 
 
 def is_staff(member: discord.Member, guild: discord.Guild) -> bool:
@@ -138,6 +151,259 @@ async def create_ticket_channel(
     )
     await msg.pin()
     return channel
+
+
+# ──────────────────────────────────────────────────────────────
+#  Fermeture (bouton Close + fermeture automatique)
+# ──────────────────────────────────────────────────────────────
+def is_media_ticket(ch: discord.abc.GuildChannel) -> bool:
+    if not isinstance(ch, discord.TextChannel) or ch.category_id != TICKET_CATEGORY_ID:
+        return False
+    topic = ch.topic or ""
+    return "ID: " in topic or "ID : " in topic or re.fullmatch(r"ticket-\d+", ch.name) is not None
+
+
+def ticket_creator_id(ch: discord.TextChannel) -> int | None:
+    match = re.search(r"ID ?: ?(\d+)", ch.topic or "")
+    if match:
+        return int(match.group(1))
+    match = re.fullmatch(r"ticket-(\d+)", ch.name)
+    return int(match.group(1)) if match else None
+
+
+async def ticket_activity_state(channel: discord.TextChannel) -> tuple[datetime.datetime, bool]:
+    """(date du dernier message humain, avertissement d'inactivité déjà posté depuis ce message).
+    Les messages du bot (embed d'ouverture, claim, notices, avertissement) ne comptent pas
+    comme activité. Sans message humain : date de création du salon."""
+    oldest_seen = None
+    warned = False
+    async for msg in channel.history(limit=100):
+        oldest_seen = msg.created_at
+        if not msg.author.bot:
+            return msg.created_at, warned
+        if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == INACTIVITY_WARNING_TITLE:
+            warned = True
+    return oldest_seen or channel.created_at, warned
+
+
+def _remaining_str(delta: datetime.timedelta) -> str:
+    total = max(int(delta.total_seconds()), 0)
+    hours, rem = divmod(total, 3600)
+    minutes = rem // 60
+    return f"{hours}h {minutes:02d}min" if hours else f"{minutes} min"
+
+
+async def find_panel_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    """Salon du panneau : TICKET_PANEL_CHANNEL_ID, puis le dernier /setup, puis détection du bouton."""
+    if TICKET_PANEL_CHANNEL_ID:
+        ch = guild.get_channel(TICKET_PANEL_CHANNEL_ID)
+        if isinstance(ch, discord.TextChannel):
+            return ch
+    cached = _panel_channel_cache.get(guild.id)
+    if cached:
+        ch = guild.get_channel(cached)
+        if isinstance(ch, discord.TextChannel):
+            return ch
+        _panel_channel_cache.pop(guild.id, None)
+    for ch in guild.text_channels:
+        if ch.category_id == TICKET_CATEGORY_ID:
+            continue
+        perms = ch.permissions_for(guild.me)
+        if not (perms.view_channel and perms.read_message_history):
+            continue
+        try:
+            async for msg in ch.history(limit=25):
+                if msg.author.id != bot.user.id or not msg.components:
+                    continue
+                for row in msg.components:
+                    for comp in getattr(row, "children", []):
+                        if getattr(comp, "custom_id", None) == PANEL_BUTTON_CUSTOM_ID:
+                            _panel_channel_cache[guild.id] = ch.id
+                            return ch
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+    return None
+
+
+def _reopen_line(panel_channel: discord.TextChannel | None) -> str:
+    if panel_channel is None:
+        return "If you still need help, feel free to open a new ticket on the server."
+    return (
+        "If you still need help, feel free to open a new ticket here: "
+        f"**[#{panel_channel.name}]({panel_channel.jump_url})** ({panel_channel.mention})"
+    )
+
+
+async def send_inactivity_warning(ch: discord.TextChannel, last_activity: datetime.datetime) -> bool:
+    """Avis dans le ticket (avec ping) puis MP au créateur avec le temps restant.
+    L'avis sert de marqueur : posté en premier, donc jamais de second MP après un redémarrage."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    close_at = last_activity + datetime.timedelta(hours=TICKET_INACTIVITY_HOURS)
+    remaining = _remaining_str(close_at - now)
+    inactive_for = _remaining_str(now - last_activity)
+    close_ts = int(close_at.timestamp())
+    uid = ticket_creator_id(ch)
+    guild = ch.guild
+
+    notice = discord.Embed(
+        title=INACTIVITY_WARNING_TITLE,
+        description=(
+            f"No activity for **{inactive_for}**.\n"
+            f"This ticket will be **closed automatically** <t:{close_ts}:R> "
+            f"(**{remaining}** left) unless someone replies here."
+        ),
+        color=0xFEE75C,
+    )
+    notice.set_footer(text=f"Media Ticket System  •  Automatic closure after {TICKET_INACTIVITY_HOURS}h of inactivity")
+    try:
+        await ch.send(
+            content=f"<@{uid}>" if uid else None,
+            embed=notice,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+    except (discord.NotFound, discord.Forbidden):
+        return False
+
+    if not uid:
+        return True
+    dm_status = "MP envoyé"
+    try:
+        creator = bot.get_user(uid) or await bot.fetch_user(uid)
+        dm = discord.Embed(
+            title="⏳ Your ticket will be closed soon",
+            description=(
+                f"Your ticket **#{ch.name}** on **{guild.name}** has had no activity for **{inactive_for}**.\n\n"
+                f"It will be **automatically closed** <t:{close_ts}:R> (in about **{remaining}**) unless you reply.\n\n"
+                f"👉 To keep it open, simply send a message in **[#{ch.name}]({ch.jump_url})**."
+            ),
+            color=0xFEE75C,
+        )
+        dm.set_footer(text=f"{guild.name}  •  Inactivity reminder")
+        await creator.send(embed=dm)
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
+        dm_status = f"MP impossible ({type(exc).__name__}) : l'avis dans le ticket reste"
+    print(f"[⏳] Ticket #{ch.name} : avertissement posté · {dm_status}")
+    return True
+
+
+async def build_transcript(channel: discord.TextChannel, closed_by_text: str) -> bytes:
+    guild = channel.guild
+    lines = [
+        "╔══════════════════════════════════════════════════════════╗",
+        "║               TRANSCRIPT — MEDIA TICKET                  ║",
+        "╚══════════════════════════════════════════════════════════╝",
+        f"  Ticket    : {channel.name}",
+        f"  Server    : {guild.name} ({guild.id})",
+        f"  Closed by : {closed_by_text}",
+        f"  Date      : {datetime.datetime.utcnow().strftime('%m/%d/%Y at %H:%M:%S')} UTC",
+        "─" * 62,
+    ]
+    async for msg in channel.history(limit=None, oldest_first=True):
+        ts     = msg.created_at.strftime("%m/%d/%Y %H:%M:%S")
+        author = f"{msg.author} ({msg.author.id})"
+        lines.append(f"[{ts}] {author}")
+        if msg.content:
+            lines.append(f"  ➜ {msg.content}")
+        for att in msg.attachments:
+            lines.append(f"  📎 Attachment: {att.url}")
+        if msg.embeds:
+            lines.append("  📌 [Embed sent]")
+        lines.append("")
+    lines.append("─" * 62)
+    lines.append("End of transcript.")
+    return "\n".join(lines).encode("utf-8")
+
+
+async def close_media_ticket(
+    channel: discord.TextChannel,
+    *,
+    closed_by: discord.abc.User | None,
+    inactive_hours: int | None = None,
+) -> bool:
+    """Annonce, transcription dans le salon des transcriptions, suppression.
+    closed_by=None => fermeture automatique : le créateur reçoit aussi un MP avec la transcription
+    et le lien du panneau. Retourne False si une fermeture est déjà en cours."""
+    guild = channel.guild
+    lock = _ticket_close_locks.setdefault(channel.id, asyncio.Lock())
+    if lock.locked():
+        return False
+
+    async with lock:
+        try:
+            auto = closed_by is None
+            closer_mention = closed_by.mention if closed_by else f"⏰ Automatic ({inactive_hours}h inactive)"
+            closer_text = f"{closed_by} ({closed_by.id})" if closed_by else f"Automatic closure ({inactive_hours}h without activity)"
+
+            close_embed = discord.Embed(
+                title="🔒  Closing Ticket",
+                description=(
+                    (f"Ticket closed automatically: no activity for **{inactive_hours} hours**.\n" if auto
+                     else f"Ticket closed by {closer_mention}.\n")
+                    + "Generating transcript…"
+                ),
+                color=0xED4245,
+                timestamp=datetime.datetime.utcnow(),
+            )
+            try:
+                await channel.send(embed=close_embed)
+            except (discord.NotFound, discord.Forbidden):
+                return True
+
+            try:
+                transcript_bytes = await build_transcript(channel, closer_text)
+            except discord.NotFound:
+                return True
+            filename = f"transcript-{channel.name}-{datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.txt"
+
+            trans_channel = guild.get_channel(TRANSCRIPT_CHANNEL_ID)
+            if trans_channel:
+                t_embed = discord.Embed(title="📄  New Transcript", color=0x57F287, timestamp=datetime.datetime.utcnow())
+                t_embed.add_field(name="📁 Ticket",     value=f"`{channel.name}`", inline=True)
+                t_embed.add_field(name="🔒 Closed by", value=closer_mention,      inline=True)
+                t_embed.add_field(name="📅 Date", value=datetime.datetime.utcnow().strftime("%m/%d/%Y %H:%M"), inline=True)
+                if auto:
+                    t_embed.add_field(name="💤 Reason", value=f"No activity for {inactive_hours}h", inline=True)
+                t_embed.set_footer(text="Media Ticket System")
+                try:
+                    await trans_channel.send(embed=t_embed, file=discord.File(io.BytesIO(transcript_bytes), filename=filename))
+                except discord.HTTPException as exc:
+                    print(f"[✗] Transcript not posted for #{channel.name}: {exc!r}")
+
+            # Fermeture automatique : MP au créateur avec la transcription et le lien du panneau
+            if auto:
+                uid = ticket_creator_id(channel)
+                if uid:
+                    try:
+                        creator = bot.get_user(uid) or await bot.fetch_user(uid)
+                        panel_channel = await find_panel_channel(guild)
+                        dm = discord.Embed(
+                            title="⏰ Your ticket was closed for inactivity",
+                            description=(
+                                f"Your ticket **#{channel.name}** on **{guild.name}** has been "
+                                f"**automatically closed** because there was no activity for **{inactive_hours} hours**.\n\n"
+                                f"{_reopen_line(panel_channel)}\n"
+                                "We'll be happy to assist you.\n\n"
+                                "Find the full transcript of your conversation attached below."
+                            ),
+                            color=0x5865F2,
+                        )
+                        dm.set_footer(text=f"{guild.name}  •  Automatic closure")
+                        try:
+                            await creator.send(embed=dm, file=discord.File(io.BytesIO(transcript_bytes), filename=filename))
+                        except discord.Forbidden:
+                            await creator.send(embed=dm)
+                    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                        pass  # MPs fermés ou utilisateur introuvable
+
+            await asyncio.sleep(5)
+            try:
+                reason = f"Ticket closed automatically: {inactive_hours}h without activity" if auto else f"Ticket closed by {closed_by}"
+                await channel.delete(reason=reason)
+            except discord.NotFound:
+                pass
+            return True
+        finally:
+            _ticket_close_locks.pop(channel.id, None)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -258,74 +524,12 @@ class TicketView(discord.ui.View):
             )
             return
 
+        lock = _ticket_close_locks.get(interaction.channel.id)
+        if lock is not None and lock.locked():
+            await interaction.response.send_message("This ticket is already being closed.", ephemeral=True)
+            return
         await interaction.response.defer()
-        channel = interaction.channel
-
-        close_embed = discord.Embed(
-            title="🔒  Closing Ticket",
-            description=(
-                f"Ticket closed by {interaction.user.mention}.\n"
-                "Generating transcript…"
-            ),
-            color=0xED4245,
-            timestamp=datetime.datetime.utcnow(),
-        )
-        await channel.send(embed=close_embed)
-
-        lines = [
-            "╔══════════════════════════════════════════════════════════╗",
-            "║               TRANSCRIPT — MEDIA TICKET                  ║",
-            "╚══════════════════════════════════════════════════════════╝",
-            f"  Ticket    : {channel.name}",
-            f"  Server    : {guild.name} ({guild.id})",
-            f"  Closed by : {interaction.user} ({interaction.user.id})",
-            f"  Date      : {datetime.datetime.utcnow().strftime('%m/%d/%Y at %H:%M:%S')} UTC",
-            "─" * 62,
-        ]
-
-        async for msg in channel.history(limit=None, oldest_first=True):
-            ts     = msg.created_at.strftime("%m/%d/%Y %H:%M:%S")
-            author = f"{msg.author} ({msg.author.id})"
-            lines.append(f"[{ts}] {author}")
-            if msg.content:
-                lines.append(f"  ➜ {msg.content}")
-            for att in msg.attachments:
-                lines.append(f"  📎 Attachment: {att.url}")
-            if msg.embeds:
-                lines.append("  📌 [Embed sent]")
-            lines.append("")
-
-        lines.append("─" * 62)
-        lines.append("End of transcript.")
-
-        transcript_bytes = "\n".join(lines).encode("utf-8")
-        filename = (
-            f"transcript-{channel.name}-"
-            f"{datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.txt"
-        )
-
-        trans_channel = guild.get_channel(TRANSCRIPT_CHANNEL_ID)
-        if trans_channel:
-            t_embed = discord.Embed(
-                title="📄  New Transcript",
-                color=0x57F287,
-                timestamp=datetime.datetime.utcnow(),
-            )
-            t_embed.add_field(name="📁 Ticket",     value=f"`{channel.name}`",           inline=True)
-            t_embed.add_field(name="🔒 Closed by", value=f"{interaction.user.mention}", inline=True)
-            t_embed.add_field(
-                name="📅 Date",
-                value=datetime.datetime.utcnow().strftime("%m/%d/%Y %H:%M"),
-                inline=True,
-            )
-            t_embed.set_footer(text="Media Ticket System")
-            await trans_channel.send(
-                embed=t_embed,
-                file=discord.File(io.BytesIO(transcript_bytes), filename=filename),
-            )
-
-        await asyncio.sleep(5)
-        await channel.delete(reason=f"Ticket closed by {interaction.user}")
+        await close_media_ticket(interaction.channel, closed_by=interaction.user)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -462,6 +666,64 @@ async def on_ready():
 
     print(f"✅  Bot connected: {bot.user} ({bot.user.id})")
 
+    # Fermeture automatique des tickets inactifs (couvre aussi ceux déjà ouverts avant ce démarrage)
+    if TICKET_INACTIVITY_HOURS > 0 and not inactivity_check.is_running():
+        inactivity_check.start()
+        warn = (
+            f"alerte MP à {TICKET_INACTIVITY_WARN_HOURS} h"
+            if 0 < TICKET_INACTIVITY_WARN_HOURS < TICKET_INACTIVITY_HOURS
+            else "sans alerte préalable"
+        )
+        print(f"[⏰] Fermeture auto des tickets après {TICKET_INACTIVITY_HOURS} h d'inactivité, {warn} "
+              f"(vérification toutes les {TICKET_INACTIVITY_CHECK_MINUTES} min)")
+
+
+# ──────────────────────────────────────────────────────────────
+#  Fermeture automatique des tickets inactifs
+# ──────────────────────────────────────────────────────────────
+@tasks.loop(minutes=TICKET_INACTIVITY_CHECK_MINUTES)
+async def inactivity_check():
+    if TICKET_INACTIVITY_HOURS <= 0:
+        return
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now - datetime.timedelta(hours=TICKET_INACTIVITY_HOURS)
+    warn_cutoff = (
+        now - datetime.timedelta(hours=TICKET_INACTIVITY_WARN_HOURS)
+        if 0 < TICKET_INACTIVITY_WARN_HOURS < TICKET_INACTIVITY_HOURS
+        else None
+    )
+    for guild in list(bot.guilds):
+        for ch in list(guild.text_channels):
+            if not is_media_ticket(ch):
+                continue
+            lock = _ticket_close_locks.get(ch.id)
+            if lock is not None and lock.locked():
+                continue
+            try:
+                last_activity, warned = await ticket_activity_state(ch)
+                if last_activity <= cutoff:
+                    if await close_media_ticket(ch, closed_by=None, inactive_hours=TICKET_INACTIVITY_HOURS):
+                        print(f"[⏰] Ticket #{ch.name} fermé : inactif depuis {TICKET_INACTIVITY_HOURS} h")
+                        await asyncio.sleep(3)
+                elif warn_cutoff is not None and not warned and last_activity <= warn_cutoff:
+                    if await send_inactivity_warning(ch, last_activity):
+                        await asyncio.sleep(1)
+            except discord.NotFound:
+                continue
+            except Exception as exc:  # une erreur sur un ticket ne doit pas arrêter la boucle
+                print(f"[✗] Fermeture auto impossible pour #{ch.name} : {exc!r}")
+
+
+@inactivity_check.before_loop
+async def _inactivity_check_wait():
+    await bot.wait_until_ready()
+    await asyncio.sleep(30)
+
+
+@inactivity_check.error
+async def _inactivity_check_error(exc: BaseException):
+    print(f"[✗] Boucle de fermeture auto en erreur : {exc!r}")
+
 
 # ──────────────────────────────────────────────────────────────
 #  Slash command : /setup
@@ -492,6 +754,7 @@ async def setup(interaction: discord.Interaction):
         embed.set_thumbnail(url=interaction.guild.icon.url)
 
     await interaction.channel.send(embed=embed, view=TicketPanelView())
+    _panel_channel_cache[interaction.guild.id] = interaction.channel.id  # cible des liens « rouvrir un ticket »
     await interaction.response.send_message(
         "✅ Ticket panel deployed successfully!", ephemeral=True
     )
