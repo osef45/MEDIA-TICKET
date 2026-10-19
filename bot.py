@@ -29,7 +29,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members         = True
 
-bot = commands.Bot(command_prefix="!", intents=intents, status=discord.Status.online)  # pastille verte « En ligne »
+bot = commands.Bot(command_prefix="!", intents=intents, status=discord.Status.dnd)  # pastille rouge « Ne pas déranger »
 
 media_soon_enabled = False
 notify_cooldowns: dict[int, float] = {}
